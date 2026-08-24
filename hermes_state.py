@@ -11398,6 +11398,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 all_rows = cursor.fetchall()
             seen: dict = {}
+            first_id: dict = {}
             for row in all_rows:
                 # Tool fields participate in the dedupe key: compaction copies
                 # them verbatim, so identical tool messages across generations
@@ -11411,10 +11412,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     row["tool_calls"],
                     row["tool_name"],
                 )
+                first_id.setdefault(key, row["id"])
                 cur = seen.get(key)
                 if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
                     seen[key] = row
-            rows = sorted(seen.values(), key=lambda r: r["id"])
+            # The selected representative may be a protected-tail copy inserted
+            # in a later compaction generation. Its own SQLite id is therefore
+            # newer than messages that were logically emitted after it. Sort by
+            # the first-ever id for each logical message, while still returning
+            # the preferred live/newest representative selected above.
+            rows = [row for key, row in sorted(seen.items(), key=lambda item: first_id[item[0]])]
             if latest:
                 rows = rows[::-1]
             rows = rows[offset:]
