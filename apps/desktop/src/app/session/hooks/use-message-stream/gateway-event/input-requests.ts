@@ -235,6 +235,7 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
     // surfaces once the user focuses that chat.
     const command = typeof payload?.command === 'string' ? payload.command : ''
     const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
+    const requestId = typeof payload?.request_id === 'string' ? payload.request_id : undefined
 
     void receiveApprovalRequest($gateway.get(), {
       // false only when a tirith warning forbids it; backend omits the field otherwise.
@@ -244,7 +245,7 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
         : undefined,
       command,
       description,
-      requestId: typeof payload?.request_id === 'string' ? payload.request_id : undefined,
+      requestId,
       sessionId: sessionId ?? null,
       smartDenied: payload?.smart_denied === true
     }).catch(() => undefined)
@@ -254,6 +255,7 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
     }
 
     dispatchNativeNotification({
+      approvalRequestId: requestId,
       actions: [
         { id: 'approve', text: translateNow('notifications.native.approveAction') },
         { id: 'reject', text: translateNow('notifications.native.rejectAction') }

@@ -166,6 +166,64 @@ export function getVenvSitePackagesEntries(
   return entries
 }
 
+export interface WindowsPythonInvocation {
+  command: string
+  env: Record<string, string>
+}
+
+/**
+ * Bypass a uv-created Windows venv launcher for console-backed serve processes.
+ * The venv python.exe/pythonw.exe files can be byte-identical shims that re-exec
+ * the console base interpreter. Resolve pyvenv.cfg's `home` key and run that
+ * base python.exe directly; the caller retains the existing windowsHide flag
+ * and overlays the venv environment.
+ */
+export function resolveWindowsPythonInvocation(
+  pythonExe: string,
+  opts: {
+    isWindows?: boolean
+    fileExists?: (p: string) => boolean
+    directoryExists?: (p: string) => boolean
+    readFile?: (p: string) => string | undefined
+  } = {}
+): WindowsPythonInvocation {
+  const isWindows = opts.isWindows ?? process.platform === 'win32'
+  const fileExists = opts.fileExists ?? ((p: string) => {
+    try {
+      return fs.statSync(p).isFile()
+    } catch {
+      return false
+    }
+  })
+  const directoryExists = opts.directoryExists ?? ((p: string) => {
+    try {
+      return fs.statSync(p).isDirectory()
+    } catch {
+      return false
+    }
+  })
+  const readFile = opts.readFile ?? ((p: string) => {
+    try {
+      return fs.readFileSync(p, 'utf8')
+    } catch {
+      return undefined
+    }
+  })
+  if (!isWindows || !pythonExe) {
+    return { command: pythonExe, env: {} }
+  }
+
+  const venvDir = path.dirname(path.dirname(pythonExe))
+  const cfg = readFile(path.join(venvDir, 'pyvenv.cfg')) || ''
+  const home = cfg.match(/^home\s*=\s*(.+)$/im)?.[1]?.trim()
+  const sitePackages = path.join(venvDir, 'Lib', 'site-packages')
+  const basePython = home ? path.join(home, 'python.exe') : ''
+  if (basePython && fileExists(basePython) && directoryExists(sitePackages)) {
+    return { command: basePython, env: { VIRTUAL_ENV: venvDir } }
+  }
+  return { command: pythonExe, env: {} }
+}
+
 export interface ResolveVenvHermesCommandDeps {
   isWindows: boolean
   isCommandScript: (command: string) => boolean

@@ -627,8 +627,8 @@ def _(rid, params: dict) -> dict:
             with _session_resume_lock:
                 if _sessions.get(sid) is not session:
                     return _err(rid, 4007, "session no longer live; retry resume")
-                if session.get("_client_gone_interrupt_requested"):
-                    return _err(rid, 4009, "session disconnect interrupt settling")
+                # A detached turn is no longer interrupted by the WS orphan
+                # reaper; resume always rebinds the still-live session.
                 # This resume reattaches the live record: cancel any pending
                 # ws-orphan reap timer armed while the client was detached
                 # (storm killer — _live_session_payload's rebind also cancels,
