@@ -5,7 +5,7 @@ import { persistString, storedString } from '@/lib/storage'
 
 import { $gateway } from './gateway'
 import { withinNativeNotifyBaseline } from './notify-baseline'
-import { clearApprovalRequest } from './prompts'
+import { clearApprovalRequest, sessionApprovalRequest } from './prompts'
 import { $activeSessionId } from './session'
 import { requestForOwnedSession } from './session-states'
 
@@ -98,6 +98,10 @@ export function setNativeNotifyKind(kind: NativeNotificationKind, on: boolean) {
 const THROTTLE_MS = 1000
 const lastFiredAt = new Map<string, number>()
 
+// Claims survive local prompt cleanup so delayed/replayed native notification
+// actions cannot send a second response for the same immutable request.
+const claimedApprovalActions = new Set<string>()
+
 function throttled(key: string, now: number): boolean {
   for (const [k, at] of lastFiredAt) {
     if (now - at >= THROTTLE_MS) {
@@ -160,6 +164,8 @@ export interface NativeNotificationInput {
   title: string
   body?: string
   sessionId?: null | string
+  /** Immutable gateway approval request identity for native action buttons. */
+  approvalRequestId?: string
   /**
    * Not tied to a chat session (e.g. pet generation). Fires whenever the user
    * is away, bypassing the session-match gate that completion kinds normally
@@ -209,6 +215,7 @@ export function dispatchNativeNotification(input: NativeNotificationInput): bool
 
   void window.hermesDesktop?.notify({
     actions: input.actions,
+    approvalRequestId: input.approvalRequestId,
     activate: input.activate,
     body: input.body,
     icon: input.icon,
@@ -346,7 +353,11 @@ export function dispatchPluginNativeNotification(pluginId: string, input: Plugin
 
 // Resolve a pending approval from a notification button, mirroring the in-app
 // Run/Reject bar. Keyed by session id — a background approval has no local guard.
-export async function respondToApprovalAction(sessionId: null | string, actionId: string): Promise<void> {
+export async function respondToApprovalAction(
+  sessionId: null | string,
+  actionId: string,
+  requestId?: string
+): Promise<void> {
   const choice = actionId === 'approve' ? 'once' : actionId === 'reject' ? 'deny' : null
 
   if (!choice) {
@@ -359,6 +370,27 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
     return
   }
 
+  const currentRequestId = sessionApprovalRequest(sessionId).get()?.requestId
+
+  // OS actions can outlive the prompt they were created for. Never infer a
+  // replacement request from the mutable session state: that could approve a
+  // newer command through an old notification button.
+  if (!requestId || requestId !== currentRequestId) {
+    return
+  }
+
+  const actionKey = `${sessionId ?? ''}:${requestId}`
+
+  // Notifications can be replayed or clicked in quick succession. Claim the
+  // immutable action before the async gateway call so only one response can
+  // escape; successful claims stay consumed even if local prompt cleanup fails.
+  if (claimedApprovalActions.has(actionKey)) {
+    return
+  }
+
+  claimedApprovalActions.add(actionKey)
+  let responded = false
+
   try {
     // Route through the session's OWNER (tile route → known profile); the
     // ambient socket follows foreground focus and, for a background approval
@@ -370,11 +402,16 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
       // call shape gateway.request callers assert on.
       gateway.request.bind(gateway) as typeof gateway.request,
       'approval.respond',
-      { choice, session_id: sessionId ?? undefined }
+      { choice, request_id: requestId, session_id: sessionId ?? undefined }
     )
-    clearApprovalRequest(sessionId)
+    responded = true
+    clearApprovalRequest(sessionId, requestId)
   } catch {
-    // Leave the prompt parked so the user can still resolve it in-app.
+    // Failed delivery leaves the prompt retryable. Once the backend accepted
+    // the response, retain the claim even if local cleanup itself failed.
+    if (!responded) {
+      claimedApprovalActions.delete(actionKey)
+    }
   }
 }
 

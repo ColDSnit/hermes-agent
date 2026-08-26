@@ -77,6 +77,17 @@ def test_explanation_quiet_for_empty_reason():
     assert AIAgent._format_turn_completion_explanation("guardrail_halt") == ""
 
 
+def test_explanation_for_review_input_budget_exhausted():
+    """Input-budget exhaustion with a pending tool result must produce
+    a user-visible explanation instead of a silent stop."""
+    out = AIAgent._format_turn_completion_explanation(
+        "review_input_budget_exhausted"
+    )
+    assert out.startswith("⚠️ No reply: ")
+    assert "input budget was exhausted" in out
+    assert "continue" in out
+
+
 
 
 

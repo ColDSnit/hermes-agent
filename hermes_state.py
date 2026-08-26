@@ -6851,7 +6851,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
-    def end_session(self, session_id: str, end_reason: str) -> None:
+    def end_session(
+        self,
+        session_id: str,
+        end_reason: str,
+        *,
+        turn_lease_holder: Optional[str] = None,
+    ) -> None:
         """Mark a session as ended.
 
         No-ops when the session is already ended. The first end_reason wins:
@@ -6867,6 +6873,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "WHERE id = ? AND ended_at IS NULL",
                 (time.time(), end_reason, session_id),
             )
+            if turn_lease_holder:
+                conversation_id = self._session_turn_lease_key_on_conn(
+                    conn, session_id
+                )
+                conn.execute(
+                    "DELETE FROM session_turn_leases "
+                    "WHERE conversation_id = ? AND holder = ?",
+                    (conversation_id, turn_lease_holder),
+                )
         self._execute_write(_do)
 
     def reopen_session(self, session_id: str) -> None:
@@ -11464,6 +11479,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 all_rows = cursor.fetchall()
             seen: dict = {}
+            first_id: dict = {}
             for row in all_rows:
                 dedupe_content = row["content"]
                 if row["role"] == "user":
@@ -11494,10 +11510,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     row["tool_calls"],
                     row["tool_name"],
                 )
+                first_id[key] = min(first_id.get(key, row["id"]), row["id"])
                 cur = seen.get(key)
                 if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
                     seen[key] = row
-            rows = sorted(seen.values(), key=lambda r: r["id"])
+            # The selected representative may be a protected-tail copy inserted
+            # in a later compaction generation. Its own SQLite id is therefore
+            # newer than messages that were logically emitted after it. Sort by
+            # the first-ever id for each logical message, while still returning
+            # the preferred live/newest representative selected above.
+            rows = [row for key, row in sorted(seen.items(), key=lambda item: first_id[item[0]])]
             if latest:
                 rows = rows[::-1]
             rows = rows[offset:]

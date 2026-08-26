@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
 
-const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
+const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n')
 
 /** Load the plugin in a vm with a scripted cli.exec so member turns are
  *  deterministic. `turnScript(profile, prompt)` returns the member's reply
@@ -304,7 +304,7 @@ test('hard caps: chatty members stop at GROUP_CHAT_MAX_MESSAGES total', async ()
   assert.ok(memberMessages.length <= gc.GROUP_CHAT_MAX_MESSAGES, `posted ${memberMessages.length}`)
 })
 
-test('failed member turn is a pass, not a room error', async () => {
+test('failed member turn posts a one-line error notice, not silence', async () => {
   const gc = load(profile => {
     if (profile === 'builder') {
       throw new Error('gateway hiccup')
@@ -318,7 +318,30 @@ test('failed member turn is a pass, not a room error', async () => {
   }
 
   const log = roomLog(gc, 'Flaky')
-  assert.equal(log.length, 1) // just the user message; no error entries
+  // user message + the failed member's one-line error notice
+  assert.equal(log.length, 2)
+  const notice = log[1]
+  assert.equal(notice.from.kind, 'member')
+  assert.equal(notice.from.name, 'builder')
+  assert.equal(notice.text, '⚠️ @user — my last turn failed (gateway hiccup); please mention me again.')
+})
+
+test('repeated failed member turns stay within the per-run message cap', async () => {
+  const gc = load(() => {
+    throw new Error('provider unavailable')
+  })
+  const manyMembers = Array.from(
+    { length: gc.GROUP_CHAT_MAX_MESSAGES + 5 },
+    (_, index) => ({ name: `builder-${index}`, title: '' })
+  )
+
+  gc.sendToGroupChat('Outage', manyMembers, 'anyone around?')
+  for (let i = 0; i < 400 && (gc.$groupChats.get().Outage || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  const memberMessages = roomLog(gc, 'Outage').filter(e => e.from.kind === 'member')
+  assert.equal(memberMessages.length, gc.GROUP_CHAT_MAX_MESSAGES)
 })
 
 test('delta injection: a second user send only feeds members the NEW messages', async () => {

@@ -629,6 +629,46 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def resolve_stream_ttfb_timeout(
+    base_url: str | None,
+    est_tokens: int,
+    stale_timeout: float,
+    env_value: str | None = None,
+) -> float:
+    """Resolve the generic stream no-first-byte cutoff in one place."""
+    if env_value is None or not str(env_value).strip():
+        configured = 120.0
+    else:
+        try:
+            configured = float(env_value)
+        except (TypeError, ValueError):
+            configured = 120.0
+    if configured <= 0:
+        return float("inf")
+    if base_url and is_local_endpoint(base_url):
+        return float("inf")
+    if est_tokens > 100_000:
+        timeout = max(configured, 300.0)
+    elif est_tokens > 50_000:
+        timeout = max(configured, 240.0)
+    else:
+        timeout = configured
+    if stale_timeout is not None and stale_timeout != float("inf"):
+        timeout = min(timeout, stale_timeout)
+    return timeout
+
+
+def ttfb_kill_should_fire(
+    first_event_seen: bool, elapsed: float, ttfb_timeout: float
+) -> bool:
+    """Return whether a no-first-byte stream should be killed now."""
+    return (
+        not first_event_seen
+        and ttfb_timeout != float("inf")
+        and elapsed > ttfb_timeout
+    )
+
+
 def _estimate_chunk_bytes(chunk: Any) -> int:
     """Cheap per-chunk size estimate for the stream diagnostic counters.
 
@@ -3791,6 +3831,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # poll loop uses this to detect stale connections that keep receiving
     # SSE keep-alive pings but no actual data.
     last_chunk_time = {"t": time.time()}
+    # No-first-byte tracking for the TTFB watchdog: set the moment the
+    # provider delivers ANY stream event (chunk or SSE frame). Until
+    # then the poll loop applies the shorter TTFB cutoff instead of the
+    # full stale patience, so a connection the provider accepted but
+    # that never delivers a byte is reconnected promptly instead of
+    # waiting out the reasoning floor (up to 600s).
+    first_stream_event_seen = {"yes": False}
     # Stale-stream patience, shared between the httpx socket read timeout
     # (built in ``_call_chat_completions`` below) and the stale-stream detector
     # (computed further down, before the worker thread starts).  Initialized
@@ -3828,6 +3875,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             stream_attempt_state["current"] += 1
             attempt_id = int(stream_attempt_state["current"])
         provider_tool_in_flight["yes"] = False
+        # Per-attempt TTFB budget: a retry that connects but never
+        # delivers a byte gets its own no-first-byte cutoff.
+        first_stream_event_seen["yes"] = False
         return attempt_id
 
     def _cancel_current_stream_attempt(reason: str) -> None:
@@ -4021,6 +4071,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # an interceptor or codec is still handling an already-received
             # event.
             last_chunk_time["t"] = time.time()
+            first_stream_event_seen["yes"] = True
             return True
 
         def _relay_final_response() -> dict[str, Any]:
@@ -4098,6 +4149,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             response=lambda: attempt_stream_response["value"],
         ):
             last_chunk_time["t"] = time.time()
+            first_stream_event_seen["yes"] = True
             agent._touch_activity("receiving stream response")
 
             # Update per-attempt diagnostic counters.  Best-effort —
@@ -4622,6 +4674,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             for event in stream:
                 saw_stream_event = True
                 last_chunk_time["t"] = time.time()
+                first_stream_event_seen["yes"] = True
                 agent._touch_activity("receiving stream response")
                 try:
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
@@ -5140,6 +5193,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
+    # ── No-first-byte TTFB watchdog (generic streaming path) ──────────
+    # A provider can accept a connection without emitting a stream event.
+    _ttfb_timeout = resolve_stream_ttfb_timeout(
+        agent.base_url,
+        estimate_request_context_tokens(api_kwargs),
+        _stream_stale_timeout,
+        os.environ.get("HERMES_STREAM_TTFB_TIMEOUT_SECONDS"),
+    )
+
     t = threading.Thread(target=_context_thread_target(_call), daemon=True)
     t.start()
     _last_heartbeat = time.time()
@@ -5181,6 +5243,45 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # leave the live display alone.
                 agent._touch_activity(
                     f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
+                )
+
+        # No-first-byte TTFB watchdog: the provider accepted the
+        # connection but has not delivered a single stream event. Kill it
+        # so the inner retry loop reconnects promptly instead of waiting
+        # out the (possibly 600s) stale patience on a dead connection.
+        if not first_stream_event_seen["yes"] and _ttfb_timeout != float("inf"):
+            _ttfb_elapsed = time.time() - last_chunk_time["t"]
+            if ttfb_kill_should_fire(
+                first_stream_event_seen["yes"], _ttfb_elapsed, _ttfb_timeout
+            ):
+                logger.warning(
+                    "Stream produced no first byte for %.0fs (TTFB threshold "
+                    "%.0fs) — no stream events received. model=%s. Killing "
+                    "connection so the retry loop can reconnect.",
+                    _ttfb_elapsed, _ttfb_timeout,
+                    api_kwargs.get("model", "unknown"),
+                )
+                agent._buffer_status(
+                    f"⚠️ No first byte from provider in {int(_ttfb_elapsed)}s "
+                    f"(model: {api_kwargs.get('model', 'unknown')}). "
+                    f"Reconnecting."
+                )
+                try:
+                    _cancel_current_stream_attempt("stream_ttfb_kill")
+                    _close_request_client_once("stream_ttfb_kill")
+                except Exception:
+                    pass
+                # Reset both guards so we don't kill repeatedly while the
+                # inner thread processes the closure. The next attempt resets
+                # this flag when it actually starts.
+                last_chunk_time["t"] = time.time()
+                first_stream_event_seen["yes"] = True
+                agent._emit_wait_notice(
+                    f"⚠ no first byte from provider in {int(_ttfb_elapsed)}s — "
+                    f"reconnecting..."
+                )
+                agent._touch_activity(
+                    f"stream killed after {int(_ttfb_elapsed)}s with no first byte"
                 )
 
         # Detect stale streams: connections kept alive by SSE pings
