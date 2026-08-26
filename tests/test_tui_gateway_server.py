@@ -4618,7 +4618,7 @@ def test_session_close_settles_active_turn_before_teardown(monkeypatch):
     assert response["result"] == {"closed": True}
 
 
-def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
+def test_ws_orphan_reap_preserves_isolated_turn_then_reaps_after_finish(monkeypatch):
     callbacks = []
     interrupted = []
     torn_down = []
@@ -4663,15 +4663,15 @@ def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
         server._schedule_ws_orphan_reap("isolated-sid")
         callbacks.pop(0)()
 
-        assert interrupted == [("isolated-sid", "client-gone-isolated-sid")]
-        assert session["_turn_cancel_requested"] is True
-        assert session["queued_prompt"] is None
+        assert interrupted == []
+        assert session.get("_turn_cancel_requested") is not True
+        assert session["queued_prompt"] == {"text": "must not run"}
         assert session["history"] == [{"role": "assistant", "content": "partial"}]
         assert len(callbacks) == 1
 
         callbacks.pop(0)()
 
-        assert interrupted == [("isolated-sid", "client-gone-isolated-sid")]
+        assert interrupted == []
         assert len(callbacks) == 1
 
         session["running"] = False
@@ -4730,42 +4730,6 @@ def test_ws_orphan_reap_spares_turn_reattached_within_grace(monkeypatch):
         server._sessions.pop("reattached-sid", None)
 
 
-def test_session_resume_does_not_rebind_after_client_gone_interrupt_claim(monkeypatch):
-    class _DB:
-        def get_session(self, session_id):
-            assert session_id == "stored-sid"
-            return {"id": session_id, "cwd": "/tmp"}
-
-        def resolve_resume_session_id(self, session_id):
-            return session_id
-
-    live_transport = object()
-    session = _session(
-        session_key="stored-sid",
-        transport=server._detached_ws_transport,
-        running=True,
-        _client_gone_interrupt_requested=True,
-    )
-    server._sessions["live-sid"] = session
-    monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setattr(server, "current_transport", lambda: live_transport)
-
-    try:
-        response = server.handle_request(
-            {
-                "id": "resume-after-claim",
-                "method": "session.resume",
-                "params": {"session_id": "stored-sid"},
-            }
-        )
-
-        assert response is not None
-        assert response["error"]["code"] == 4009
-        assert response["error"]["message"] == "session disconnect interrupt settling"
-        assert session["transport"] is server._detached_ws_transport
-    finally:
-        server._sessions.pop("live-sid", None)
-
 
 def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
     callbacks = []
@@ -4813,16 +4777,17 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
 
         callbacks.pop(0)()
 
-        assert interrupted == ["interrupted"]
+        assert interrupted == []
         assert len(callbacks) == 1
 
+        session["running"] = False
         callbacks.pop(0)()
         assert "delegating-turn" not in server._sessions
     finally:
         server._sessions.pop("delegating-turn", None)
 
 
-def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
+def test_ws_orphan_reap_does_not_interrupt_in_process_turn(monkeypatch):
     callbacks = []
     interrupted = []
 
@@ -4856,11 +4821,65 @@ def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
         server._schedule_ws_orphan_reap("inline-sid")
         callbacks.pop(0)()
 
-        assert interrupted == ["interrupted"]
-        assert session["_turn_cancel_requested"] is True
+        assert interrupted == []
+        assert session.get("_turn_cancel_requested") is not True
         assert len(callbacks) == 1
     finally:
         server._sessions.pop("inline-sid", None)
+
+
+def test_ws_orphan_reap_preserves_detached_running_turn_until_it_finishes(monkeypatch):
+    callbacks = []
+    interrupted = []
+    torn_down = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+        def cancel(self):
+            return None
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    session = _session(
+        agent=types.SimpleNamespace(interrupt=lambda: interrupted.append("interrupted")),
+        transport=server._detached_ws_transport,
+        running=True,
+        _run_thread=_LiveThread(),
+        queued_prompt={"text": "continue after this turn"},
+    )
+    server._sessions["background-sid"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(
+        server,
+        "_teardown_popped_session",
+        lambda claimed, *, end_reason: torn_down.append((claimed, end_reason)) or True,
+    )
+
+    try:
+        server._schedule_ws_orphan_reap("background-sid")
+        callbacks.pop(0)()
+
+        assert interrupted == []
+        assert session["queued_prompt"] == {"text": "continue after this turn"}
+        assert "background-sid" in server._sessions
+        assert len(callbacks) == 1
+
+        session["running"] = False
+        callbacks.pop(0)()
+
+        assert "background-sid" not in server._sessions
+        assert torn_down == [(session, "ws_orphan_reap")]
+    finally:
+        server._sessions.pop("background-sid", None)
 
 
 def test_ws_disconnect_running_sidecar_still_closes_without_orphan_timer(monkeypatch):
@@ -5141,6 +5160,92 @@ def test_finalize_session_closes_slash_worker(monkeypatch):
     server._finalize_session(session)
     server._teardown_session(session)
     assert closed["count"] == 1
+
+
+def test_finalize_session_does_not_end_live_mid_turn_session(monkeypatch, tmp_path):
+    """#88197 Bug 1 — teardown must not stamp ended_at on a live session.
+
+    The shutdown path skips the turn-thread settle join by design because
+    the process is exiting, so _finalize_session can run while the turn
+    thread is still alive. Stamping ended_at makes later compression
+    rotation abort on the "parent already ended" guard. The row must stay
+    live until the turn is finalized or the session is otherwise closed.
+    """
+    ended = []
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    class _DB:
+        def get_session(self, _key):
+            return {"id": _key, "source": "tui"}
+
+        def end_session(self, key, reason):
+            ended.append((key, reason))
+
+    monkeypatch.setattr("hermes_state.SessionDB", lambda **kw: _DB())
+
+    # Mid-turn finalize (running=True): must NOT end the row.
+    session = _session(
+        session_key="live-mid-turn",
+        profile_home=str(tmp_path / "profile-home"),
+        running=True,
+        _run_thread=_LiveThread(),
+    )
+    server._finalize_session(session)
+    assert ended == [], f"mid-turn finalize ended the row: {ended}"
+
+    # Idle finalize with a dead thread: must end the row as before.
+    class _DeadThread:
+        def is_alive(self):
+            return False
+
+    session2 = _session(
+        session_key="idle-session",
+        profile_home=str(tmp_path / "profile-home"),
+        running=False,
+        _run_thread=_DeadThread(),
+    )
+    server._finalize_session(session2)
+    assert ended == [("idle-session", "tui_close")]
+
+
+def test_finalize_session_does_not_end_live_turn_thread_session(monkeypatch, tmp_path):
+    """#88197 Bug 1 — running flag cleared but turn thread still alive.
+
+    The running flag is cleared under history_lock at the END of the
+    turn's finally block, but a teardown racing that window can observe
+    running=False while the thread is still unwinding. The thread-liveness
+    check is the backstop: a live thread means the session is not done.
+    """
+    ended = []
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    class _DB:
+        def get_session(self, _key):
+            return {"id": _key, "source": "tui"}
+
+        def end_session(self, key, reason):
+            ended.append((key, reason))
+
+    monkeypatch.setattr("hermes_state.SessionDB", lambda **kw: _DB())
+
+    session = _session(
+        session_key="live-thread",
+        profile_home=str(tmp_path / "profile-home"),
+        running=False,  # flag already cleared, thread still unwinding
+        _run_thread=_LiveThread(),
+    )
+    server._finalize_session(session)
+    assert ended == [], f"live-thread finalize ended the row: {ended}"
 
 
 def test_close_transport_rebinds_session_to_remaining_viewer(monkeypatch):
@@ -21052,3 +21157,53 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+
+
+def test_ws_orphan_reap_force_reaps_hung_running_turn_after_bound(monkeypatch):
+    callbacks = []
+    torn_down = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+        def cancel(self):
+            return None
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    session = _session(
+        transport=server._detached_ws_transport,
+        running=True,
+        _run_thread=_LiveThread(),
+    )
+    sid = "hung-running-sid"
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_MAX_POLLS", 2)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(
+        server,
+        "_teardown_popped_session",
+        lambda claimed, *, end_reason: torn_down.append((claimed, end_reason)) or True,
+    )
+
+    try:
+        server._schedule_ws_orphan_reap(sid)
+        callbacks.pop(0)()
+        assert sid in server._sessions
+        callbacks.pop(0)()
+        assert sid in server._sessions
+        callbacks.pop(0)()
+        assert sid not in server._sessions
+        assert torn_down == [(session, "ws_orphan_reap")]
+    finally:
+        server._sessions.pop(sid, None)
+        server._pending_ws_reaps.pop(sid, None)
+        server._ws_orphan_reap_polls.pop(sid, None)

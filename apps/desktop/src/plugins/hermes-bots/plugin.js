@@ -7928,7 +7928,21 @@ async function runGroupChatRounds(group, members, thread) {
         } catch (error) {
           recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
           noteBotAttention(groupMemberKey(member), error?.message || error)
-          reply = null // a failed turn is a pass, never a room error
+          // A failed turn is NOT a pass: the room must see that the member
+          // holding the ball hit an error, or the failure reads as silence.
+          // Post one bounded diagnostic line. This is an honest failure notice,
+          // not a retry: the user can mention the member again to re-drive it.
+          const errText = String(error?.message || error || 'turn failed').trim().slice(0, 200)
+          appendGroupChatEntry(
+            group,
+            { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
+            `⚠️ @user — my last turn failed (${errText}); please mention me again.`,
+            thread
+          )
+          // Failure notices are member messages too; count them against the
+          // per-run cap so a sustained outage cannot flood the room.
+          posted += 1
+          reply = null
         }
 
         // #93127: the turn may have finished AFTER a newer user send bumped

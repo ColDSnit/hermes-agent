@@ -21,7 +21,8 @@ import {
   buildPathExtCandidates,
   chooseUpdaterArgs,
   getVenvSitePackagesEntries,
-  resolveVenvHermesCommand
+  resolveVenvHermesCommand,
+  resolveWindowsPythonInvocation
 } from './windows-hermes-path'
 
 test('buildPathExtCandidates: Windows tries PATHEXT extensions before the empty extension', () => {
@@ -169,6 +170,34 @@ test('resolveVenvHermesCommand: is case-insensitive on hermes.exe and the Script
 
   assert.ok(resolveVenvHermesCommand('/root/venv/Scripts/HERMES.EXE', [], deps))
   assert.ok(resolveVenvHermesCommand('/root/venv/SCRIPTS/hermes.exe', [], deps))
+})
+
+// ── resolveWindowsPythonInvocation ─────────────────────────────────────────
+
+test('resolveWindowsPythonInvocation bypasses the venv shim to base python.exe', () => {
+  const files = new Set([
+    'C:\\uv\\python\\python.exe',
+    'C:\\Hermes\\venv\\Lib\\site-packages\\pip'
+  ])
+  const result = resolveWindowsPythonInvocation('C:\\Hermes\\venv\\Scripts\\python.exe', {
+    isWindows: true,
+    fileExists: file => files.has(file),
+    directoryExists: file => file === 'C:\\Hermes\\venv\\Lib\\site-packages',
+    readFile: file => file.endsWith('pyvenv.cfg') ? 'home = C:\\uv\\python\\\nuv = 0.9' : undefined
+  })
+  assert.equal(result.command, 'C:\\uv\\python\\python.exe')
+  assert.equal(result.env.VIRTUAL_ENV, 'C:\\Hermes\\venv')
+})
+
+test('resolveWindowsPythonInvocation keeps the original command when the base is unavailable', () => {
+  const result = resolveWindowsPythonInvocation('C:\\Hermes\\venv\\Scripts\\python.exe', {
+    isWindows: true,
+    fileExists: () => false,
+    directoryExists: () => false,
+    readFile: () => 'home = C:\\missing'
+  })
+  assert.equal(result.command, 'C:\\Hermes\\venv\\Scripts\\python.exe')
+  assert.deepEqual(result.env, {})
 })
 
 // ── getVenvSitePackagesEntries ─────────────────────────────────────────────

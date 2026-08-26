@@ -383,7 +383,8 @@ import {
   buildPathExtCandidates,
   chooseUpdaterArgs,
   getVenvSitePackagesEntries,
-  resolveVenvHermesCommand
+  resolveVenvHermesCommand,
+  resolveWindowsPythonInvocation
 } from './windows-hermes-path'
 import { connectWindowsRemote, detectRemotePlatform, helper } from './windows-remote-lifecycle'
 import {
@@ -2759,14 +2760,69 @@ function resolveUpdateRoot() {
   return candidates.find(c => directoryExists(path.join(c, '.git'))) || candidates[0] || ACTIVE_HERMES_ROOT
 }
 
+const WINDOWS_GIT_PROXY_CODE = [
+  'import subprocess,sys',
+  'a=sys.argv[2:] if len(sys.argv)>1 and sys.argv[1]=="--" else sys.argv[1:]',
+  'p=subprocess.Popen(a,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))',
+  'o,e=p.communicate()',
+  'sys.stdout.buffer.write(o);sys.stdout.buffer.flush();sys.stderr.buffer.write(e);sys.stderr.buffer.flush()',
+  'raise SystemExit(p.returncode or 0)'
+].join(';')
+
+function resolveWindowlessGitProxy() {
+  if (!IS_WINDOWS) {
+    return null
+  }
+
+  const venvPython = getVenvPython(VENV_ROOT)
+  const base = resolveWindowsPythonInvocation(venvPython, {
+    isWindows: true,
+    fileExists,
+    directoryExists
+  })
+
+  // Only use the real base pythonw.exe. A uv venv pythonw.exe is the same
+  // console shim as python.exe on this machine and is deliberately rejected.
+  if (!base.env.VIRTUAL_ENV) {
+    return null
+  }
+
+  const pythonw = base.command.replace(/python\\.exe$/i, 'pythonw.exe')
+  if (!fileExists(pythonw)) {
+    return null
+  }
+
+  return {
+    command: pythonw,
+    env: {
+      ...buildDesktopBackendEnv({
+        hermesHome: HERMES_HOME,
+        pythonPathEntries: [ACTIVE_HERMES_ROOT, ...getVenvSitePackagesEntries(VENV_ROOT)],
+        venvRoot: VENV_ROOT
+      }),
+      ...base.env
+    }
+  }
+}
+
 function runGit(args, options: any = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
+    const git = resolveGitBinary()
+    const gitArgs = IS_WINDOWS ? ['-c', 'windows.appendAtomically=false', ...args] : args
+    const proxy = resolveWindowlessGitProxy()
+    const command = proxy?.command || git
+    const childArgs = proxy ? ['-c', WINDOWS_GIT_PROXY_CODE, '--', git, ...gitArgs] : gitArgs
     const child = spawn(
-      resolveGitBinary(),
-      IS_WINDOWS ? ['-c', 'windows.appendAtomically=false', ...args] : args,
+      command,
+      childArgs,
       hiddenWindowsChildOptions({
         cwd: options.cwd,
-        env: { ...process.env, ...((options.env || {}) as any), GIT_TERMINAL_PROMPT: '0' },
+        env: {
+          ...process.env,
+          ...(proxy?.env || {}),
+          ...((options.env || {}) as any),
+          GIT_TERMINAL_PROMPT: '0'
+        },
         stdio: ['ignore', 'pipe', 'pipe']
       })
     )
@@ -4524,18 +4580,25 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
   // system python, where the historical layout is the best guess.
   const venvRoot = venvRootForPython(python, root) ?? path.join(root, 'venv')
   const venvPython = getVenvPython(venvRoot)
-  const command = IS_WINDOWS && fileExists(venvPython) ? venvPython : python
+  const pythonInvocation = resolveWindowsPythonInvocation(
+    IS_WINDOWS && fileExists(venvPython) ? venvPython : python,
+    { isWindows: IS_WINDOWS, fileExists, directoryExists }
+  )
+  const command = pythonInvocation.command
 
   return {
     kind: 'python',
     label,
     command,
     args: ['-m', 'hermes_cli.main', ...backendArgs],
-    env: buildDesktopBackendEnv({
-      hermesHome: HERMES_HOME,
-      pythonPathEntries: [root, ...getVenvSitePackagesEntries(venvRoot)],
-      venvRoot
-    }),
+    env: {
+      ...buildDesktopBackendEnv({
+        hermesHome: HERMES_HOME,
+        pythonPathEntries: [root, ...getVenvSitePackagesEntries(venvRoot)],
+        venvRoot
+      }),
+      ...pythonInvocation.env
+    },
     root,
     bootstrap: Boolean(options.bootstrap),
     shell: false
@@ -4548,18 +4611,25 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
 // ensureRuntime() to create / refresh it before launch.
 function createActiveBackend(backendArgs) {
   const venvPython = getVenvPython(VENV_ROOT)
-  const command = fileExists(venvPython) ? venvPython : findSystemPython()
+  const pythonInvocation = resolveWindowsPythonInvocation(
+    fileExists(venvPython) ? venvPython : findSystemPython(),
+    { isWindows: IS_WINDOWS, fileExists, directoryExists }
+  )
+  const command = pythonInvocation.command
 
   return {
     kind: 'python',
     label: `Hermes at ${ACTIVE_HERMES_ROOT}`,
     command,
     args: ['-m', 'hermes_cli.main', ...backendArgs],
-    env: buildDesktopBackendEnv({
-      hermesHome: HERMES_HOME,
-      pythonPathEntries: [ACTIVE_HERMES_ROOT, ...getVenvSitePackagesEntries(VENV_ROOT)],
-      venvRoot: VENV_ROOT
-    }),
+    env: {
+      ...buildDesktopBackendEnv({
+        hermesHome: HERMES_HOME,
+        pythonPathEntries: [ACTIVE_HERMES_ROOT, ...getVenvSitePackagesEntries(VENV_ROOT)],
+        venvRoot: VENV_ROOT
+      }),
+      ...pythonInvocation.env
+    },
     root: ACTIVE_HERMES_ROOT,
     bootstrap: true,
     shell: false
@@ -4899,8 +4969,14 @@ async function ensureRuntime(backend) {
     )
   }
 
-  backend.command = getVenvPython(VENV_ROOT)
-  backend.label = `Hermes at ${ACTIVE_HERMES_ROOT} (venv: ${VENV_ROOT})`
+  const pythonInvocation = resolveWindowsPythonInvocation(getVenvPython(VENV_ROOT), {
+    isWindows: IS_WINDOWS,
+    fileExists,
+    directoryExists
+  })
+  backend.command = pythonInvocation.command
+  backend.env = { ...(backend.env || {}), ...pythonInvocation.env }
+  backend.label = `Hermes at ${ACTIVE_HERMES_ROOT} (base runtime for venv: ${VENV_ROOT})`
   updateBootProgress({
     phase: 'runtime.ready',
     message: 'Hermes runtime is ready',
@@ -11349,6 +11425,15 @@ async function startHermes() {
     setWslBridgeProfileState(primaryProfile, true)
 
     const backend = setup.backend
+    if (backend.kind === 'python') {
+      const pythonInvocation = resolveWindowsPythonInvocation(backend.command, {
+        isWindows: IS_WINDOWS,
+        fileExists,
+        directoryExists
+      })
+      backend.command = pythonInvocation.command
+      backend.env = { ...(backend.env || {}), ...pythonInvocation.env }
+    }
     // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
     backend.args = getBackendArgsForRuntime(backend)
     const hermesCwd = resolveHermesCwd()
@@ -14875,7 +14960,11 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
 
     // Approvals keep the existing session-scoped channel.
     if (payload?.sessionId && !payload?.notifyId && !payload?.activate) {
-      mainWindow.webContents.send('hermes:notification-action', { sessionId: payload.sessionId, actionId: action.id })
+      mainWindow.webContents.send('hermes:notification-action', {
+        actionId: action.id,
+        approvalRequestId: payload?.approvalRequestId,
+        sessionId: payload.sessionId
+      })
 
       return
     }

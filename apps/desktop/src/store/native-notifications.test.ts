@@ -145,6 +145,17 @@ describe('dispatchNativeNotification preferences', () => {
       expect.objectContaining({ body: 'hi', kind: 'turnError', sessionId: 'abc', title: 'boom' })
     )
   })
+
+  it('forwards an approval request ID to the Electron bridge', () => {
+    dispatchNativeNotification({
+      approvalRequestId: 'request-1',
+      kind: 'approval',
+      sessionId: 'abc',
+      title: 'approve'
+    })
+
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ approvalRequestId: 'request-1' }))
+  })
 })
 
 describe('dispatchNativeNotification post-connect baseline', () => {
@@ -316,17 +327,83 @@ describe('respondToApprovalAction', () => {
 
   it('approves via approval.respond {choice: "once"} and clears the prompt', async () => {
     setActiveSessionId('bg')
-    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', sessionId: 'bg' })
+    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', requestId: 'request-1', sessionId: 'bg' })
 
-    await respondToApprovalAction('bg', 'approve')
+    await respondToApprovalAction('bg', 'approve', 'request-1')
 
-    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'bg' })
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      choice: 'once',
+      request_id: 'request-1',
+      session_id: 'bg'
+    })
     expect($approvalRequest.get()).toBeNull()
   })
 
   it('rejects via approval.respond {choice: "deny"}', async () => {
-    await respondToApprovalAction('bg', 'reject')
-    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })
+    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', requestId: 'request-2', sessionId: 'bg' })
+
+    await respondToApprovalAction('bg', 'reject', 'request-2')
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      choice: 'deny',
+      request_id: 'request-2',
+      session_id: 'bg'
+    })
+  })
+
+  it('ignores a stale action rather than approving a newer request in the same session', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({ command: 'new command', description: 'new', requestId: 'request-new', sessionId: 'bg' })
+
+    await respondToApprovalAction('bg', 'approve', 'request-old')
+
+    expect(request).not.toHaveBeenCalled()
+    expect($approvalRequest.get()?.requestId).toBe('request-new')
+  })
+
+  it('ignores an action without immutable request identity', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({ command: 'command', description: 'pending', requestId: 'request-3', sessionId: 'bg' })
+
+    await respondToApprovalAction('bg', 'approve')
+
+    expect(request).not.toHaveBeenCalled()
+    expect($approvalRequest.get()?.requestId).toBe('request-3')
+  })
+
+  it('sends a matching approval action exactly once across duplicate clicks', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({ command: 'command', description: 'pending', requestId: 'request-4', sessionId: 'bg' })
+    let resolveRequest: (() => void) | undefined
+    request.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          resolveRequest = () => resolve({ resolved: true })
+        })
+    )
+
+    const first = respondToApprovalAction('bg', 'approve', 'request-4')
+    const duplicate = respondToApprovalAction('bg', 'approve', 'request-4')
+
+    expect(request).toHaveBeenCalledTimes(1)
+    resolveRequest?.()
+    await Promise.all([first, duplicate])
+
+    await respondToApprovalAction('bg', 'approve', 'request-4')
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it('releases a failed action claim so the same approval can be retried', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({ command: 'command', description: 'pending', requestId: 'request-5', sessionId: 'bg' })
+    request.mockRejectedValueOnce(new Error('transport unavailable'))
+
+    await respondToApprovalAction('bg', 'approve', 'request-5')
+    expect(request).toHaveBeenCalledTimes(1)
+    expect($approvalRequest.get()?.requestId).toBe('request-5')
+
+    await respondToApprovalAction('bg', 'approve', 'request-5')
+    expect(request).toHaveBeenCalledTimes(2)
+    expect($approvalRequest.get()).toBeNull()
   })
 
   it('ignores unknown action ids', async () => {
